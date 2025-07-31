@@ -1,0 +1,4 @@
+# motivation.png
+# method.png
+# quan.png
+# qual.png
