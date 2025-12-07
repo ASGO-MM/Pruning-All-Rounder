@@ -30,7 +30,7 @@ achieves a superior balance between performance and efficiency. Notably, PAR is 
 
 ## Installation
 
-Coming soon.
+Please see details in LLaVA and Qwen-VL directory.
 
 ## Acknowlegdements
 
