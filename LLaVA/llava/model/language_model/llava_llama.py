@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from transformers.activations import ACT2FN
 
 from typing import List, Optional, Tuple, Union
 
@@ -20,6 +21,7 @@ import torch.nn as nn
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
+from .llama import LlamaModel, LlamaForCausalLM
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
@@ -68,7 +70,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        select_tokens: Optional[torch.LongTensor] = None,
+        unselect_tokens: Optional[torch.LongTensor] = None,
+        select_layers: Optional[torch.LongTensor] = None,
+        selector_output_prob: Optional[torch.FloatTensor] = None,
+        the_first_step: Optional[bool] = None,
+        inputs_embeds_4_selector: Optional[torch.FloatTensor] = None,
+        drop_layers: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        # the_first_step = False
+
+        if inputs_embeds is not None:
+            original_length = inputs_embeds.shape[1]
+
 
         if inputs_embeds is None:
             (
@@ -77,7 +92,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 inputs_embeds,
-                labels
+                labels,
+                original_length
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
                 position_ids,
@@ -87,6 +103,48 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes
             )
+            if inputs_embeds is None:
+                the_first_step = False
+
+        if self.training and inputs_embeds is not None:
+            inputs_embeds_4_selector = inputs_embeds
+            inputs_embeds = inputs_embeds[:, : original_length, :]
+            attention_mask = attention_mask[:, : original_length]
+            labels = labels[:, : original_length]
+
+        # TODO: For now, we don't consider token-level.
+        if the_first_step or self.training:
+
+            selector_attention_mask = (
+                    torch.ones([inputs_embeds_4_selector.shape[0], inputs_embeds_4_selector.shape[1]]) == 1)
+            selector_attention_mask = selector_attention_mask.to(inputs_embeds_4_selector.device)
+            selector_position_ids = torch.range(0, inputs_embeds_4_selector.shape[1] - 1, dtype=torch.long).unsqueeze(0)
+            selector_position_ids = selector_position_ids.to(inputs_embeds_4_selector.device)
+
+
+            selector_output = self.get_model().mm_selector.forward(
+                input_ids=input_ids,
+                attention_mask=selector_attention_mask,
+                position_ids=selector_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds_4_selector,
+                original_length=original_length,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                select_tokens=select_tokens,
+                select_layers=select_layers,
+            )
+
+
+            if self.config.mode == "mask":
+                select_tokens = selector_output["select_tokens"]
+                unselect_tokens = selector_output["unselect_tokens"]
+                select_layers = selector_output["select_layers"]
+                selector_output_prob = selector_output["selector_output_prob"]
+            else:
+                raise Exception("Only mask mode is supported in simplified selector.")
 
         return super().forward(
             input_ids=input_ids,
@@ -98,7 +156,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            return_dict=return_dict,
+            select_tokens=select_tokens,
+            unselect_tokens=unselect_tokens,
+            select_layers=select_layers,
+            selector_output_prob=selector_output_prob,
         )
 
     @torch.no_grad()
@@ -114,6 +176,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
+        the_first_step = None
+        inputs_embeds_4_selector = None
+
         if images is not None:
             (
                 inputs,
@@ -121,7 +186,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 _,
                 inputs_embeds,
-                _
+                _,
+                original_length
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs,
                 position_ids,
@@ -131,8 +197,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes=image_sizes
             )
+            inputs_embeds_4_selector = inputs_embeds
+            inputs_embeds = inputs_embeds[:, : original_length, :]
+            the_first_step = True
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+
+        kwargs["the_first_step"] = True
+        kwargs["inputs_embeds_4_selector"] = inputs_embeds_4_selector
 
         return super().generate(
             position_ids=position_ids,
@@ -148,6 +220,16 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
+
+        inputs["the_first_step"] = kwargs.pop("the_first_step", None)
+        inputs["inputs_embeds_4_selector"] = kwargs.pop("inputs_embeds_4_selector", None)
+
+        inputs["select_tokens"] = kwargs.pop("select_tokens", None)
+        inputs["unselect_tokens"] = kwargs.pop("unselect_tokens", None)
+        inputs["select_layers"] = kwargs.pop("select_layers", None)
+
+        inputs["drop_layers"] = kwargs.pop("drop_layers", None)
+
         if images is not None:
             inputs['images'] = images
         if image_sizes is not None:
