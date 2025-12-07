@@ -1292,6 +1292,12 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
 
+            if select_layers is not None:
+                if decoder_layer.layer_idx in select_layers:
+                    # only update hidden_states when select this layer.
+                    hidden_states = layer_outputs[0]
+
+
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
