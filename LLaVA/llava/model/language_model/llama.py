@@ -1292,10 +1292,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
 
-            if decoder_layer.layer_idx not in [24]:
-                hidden_states = layer_outputs[0]
-
-
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
